@@ -1,124 +1,244 @@
 #!/usr/bin/env bash
 
-REV=$(tput rev)
-BLD=$(tput bold)
-GRY="\e[90m"
+# NodeOS
+#
+# Copyright (c) 2013-2017 Jacob Groundwater, Jesús Leganés-Combarro 'piranna'
+# and other contributors
+#
+# MIT License
+
+set -o pipefail
 
 
-BAREBONES=`pwd`/node_modules/nodeos-barebones
-INITRAMFS=`pwd`/node_modules/nodeos-initramfs
+while getopts ":k:p:" opt; do
+  case $opt in
+    k)
+      KERNEL="$OPTARG"  # linux, netbsd, nokernel
+    ;;
 
-TOOLCHAIN=$BAREBONES/node_modules/nodeos-cross-toolchain
+    p)
+      PLATFORM="$OPTARG"  # lxc, qemu, wsl
+    ;;
+  esac
+done
+
+
+# Default kernel and platform
+if [[ -z "$KERNEL" ]]; then
+  KERNEL=linux
+fi
+
+if [[ -z "$PLATFORM" ]]; then
+  PLATFORM=qemu
+fi
+
+
+TOOLCHAIN=`node -p "require('nodeos-cross-toolchain')"`
+BAREBONES=`node -p "require('nodeos-barebones')"`
+INITRAMFS=`node -p "require('nodeos-initramfs')"`
+USERSFS=`  node -p "require('nodeos-usersfs')"`
 
 source $TOOLCHAIN/scripts/adjustEnvVars.sh || exit $?
 
 
-case $PLATFORM in
-  docker)
-    # if user is logged into docker index
-    # automatically prefix their name to built images
-    name=$(docker info | grep ^Username | awk '{print $2}' )
-    if [[ -z "$name" ]]; then name=local; fi
+OUT_DIR=`pwd`/out/$CPU_FAMILY/$MACHINE/$PLATFORM
 
-    NOSN=${name}/nodeos
-  ;;
-esac
+export MACHINE
 
-export PLATFORM
+if [[ "$PLATFORM" == "docker" ]]; then
+  export KERNEL=nokernel
+fi
+
+# Default: multiple users system
+export SINGLE_USER=${SINGLE_USER-"nodeos-boot-multiUser"}
+
+NPMi="npm install --arch=$NODE_ARCH --production"
 
 
-## Build each layer up
-#(cd node_modules/nodeos-cross-toolchain              npm install ) &&
-#(cd node_modules/nodeos-barebones                    npm install ) &&
-#(cd node_modules/nodeos-initramfs                    npm install ) &&
-#(cd node_modules/nodeos-rootfs                       npm install ) &&
-#(cd node_modules/nodeos-usersfs         name=${NOSN} npm install ) || err $?
+#
+# Build each layer up
+#
+
+( cd $BAREBONES && $NPMi ) &&
+( cd $INITRAMFS && $NPMi ) || exit 10
+
+if [ "$SINGLE_USER" == "nodeos-boot-multiUser" ]; then
+  ( cd $USERSFS && $NPMi ) || exit 11
+fi
 
 
 #
 # Wrap the system up and pack it
 #
 
-# Disk images are a composition of rootfs and usersfs
-function createDiskImage() {
-  mkdir -p `dirname $OBJECTS`
+BAREBONES=$BAREBONES/out/$CPU
+INITRAMFS=$INITRAMFS/out/${CPU}_${SINGLE_USER}
+USERSFS=$USERSFS/out/$CPU.tar.gz
 
-  # ToDo: sizes would need to be on cylinders and retain DOS compatibility
-  # http://elinux.org/RPi_Advanced_Setup#Advanced_SD_card_setup
+STEP_DIR=$OUT_DIR
 
-  ROOTFS=node_modules/nodeos-rootfs/rootfs.img
-  USERSFS=node_modules/nodeos-usersfs/usersfs.img
+mkdir -p $STEP_DIR
 
-  SIZE_MBR=$((2*1024))
-  SIZE_ROOTFS=$(stat -L -c%s "$ROOTFS")
-  SIZE_ROOTFS=$(($SIZE_ROOTFS/512))
-  START_USERSFS=$(($SIZE_MBR+$SIZE_ROOTFS))
-
-  dd if=/dev/zero of=$OBJECTS count=$SIZE_MBR &&
-  cat $ROOTFS  >> $OBJECTS                    &&
-  cat $USERSFS >> $OBJECTS                    || exit 10
-
-  eval "echo \"$(< resources/sfdisk.txt)\"" | /sbin/sfdisk -uS --force $OBJECTS || exit 11
+function copyAndConvertInitrams() {
+  cpio2tar $BAREBONES/barebones.cpio.gz | gzip -c > $STEP_DIR/barebones              || err 20
+  cpio2tar $INITRAMFS                   | gzip -c > $STEP_DIR/initramfs-$SINGLE_USER || err 21
 }
 
-case $PLATFORM in
-  raspberry_image)
-    createDiskImage || exit $?
+case $MACHINE in
+  pc)
+    case $PLATFORM in
+      disk)
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 30
+
+        nodeos-bootfs                \
+            -F $PLATFORM             \
+            -K $BAREBONES/bzImage    \
+            -I $INITRAMFS            \
+            -O $STEP_DIR/disk.img    \
+            -U $STEP_DIR/usersfs.img || err 31
+
+        rm -f $STEP_DIR/usersfs.img || err 32
+      ;;
+
+      docker)
+        copyAndConvertInitrams || exit $?
+
+        # Docker already provides `/dev/console` by default
+        gunzip $STEP_DIR/barebones -c         | \
+            tar --delete dev/console          | \
+            gzip > $STEP_DIR/barebones.tar.gz || err 40
+
+        mv $STEP_DIR/initramfs-$SINGLE_USER $STEP_DIR/initramfs.tar.gz || err 41
+
+        # Exec `logon` directly instead of use `node-bin-getty` on the console
+        mkdir -p root/etc && cp resources/palmtree.json root/etc || err 42
+
+        gunzip $USERSFS -c                                              | \
+            tar --delete root/etc/palmtree.json > $STEP_DIR/usersfs.tar || err 43
+
+        tar -f $STEP_DIR/usersfs.tar -r root/etc/palmtree.json || err 44
+        gzip -f $STEP_DIR/usersfs.tar                          || err 45
+
+        # Delete temporal initrams
+        rm -rf root $STEP_DIR/barebones $STEP_DIR/usersfs.tar || err 46
+      ;;
+
+      img)
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 50
+
+        nodeos-bootfs                \
+            -F $PLATFORM             \
+            -K $BAREBONES/bzImage    \
+            -I $INITRAMFS            \
+            -O $STEP_DIR/bootfs.img  \
+            -U $STEP_DIR/usersfs.img || err 51
+      ;;
+
+      iso)
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 60
+
+        nodeos-bootfs                \
+            -F $PLATFORM             \
+            -K $BAREBONES/bzImage    \
+            -I $INITRAMFS            \
+            -O $STEP_DIR/bootfs.iso  \
+            -U $STEP_DIR/usersfs.img || err 61
+      ;;
+
+      qemu)
+        cp $BAREBONES/bzImage $STEP_DIR/kernel            || err 70
+        cp $INITRAMFS         $STEP_DIR/initramfs.cpio.gz || err 71
+
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 72
+      ;;
+
+      tar)
+        copyAndConvertInitrams || exit $?
+
+        nodeos-bootfs                           \
+            -B $STEP_DIR/barebones              \
+            -F $PLATFORM                        \
+            -I $STEP_DIR/initramfs-$SINGLE_USER \
+            -O $STEP_DIR/bootfs.tar.gz          || err 80
+
+        cp $USERSFS $STEP_DIR/usersfs.tar.gz || err 81
+
+        # Delete temporal initrams
+        rm -f $STEP_DIR/barebones $STEP_DIR/initramfs-$SINGLE_USER || err 82
+      ;;
+
+      vagga)
+        copyAndConvertInitrams || exit $?
+
+        gunzip $STEP_DIR/barebones -c          | \
+            tar --delete dev/console sbin/init | \
+            gzip > $STEP_DIR/barebones.tar.gz  || err 90
+
+        mv $STEP_DIR/initramfs-$SINGLE_USER $STEP_DIR/initramfs.tar.gz || err 91
+
+        cp $USERSFS $STEP_DIR/usersfs.tar.gz || err 92
+
+        # Delete temporal initrams
+        rm -f $STEP_DIR/barebones || err 93
+      ;;
+
+      *)
+        echo -e "${RED}Unknown platform '$PLATFORM'${CLR}"
+        err 100
+      ;;
+    esac
+  ;;
+
+  raspi|raspi2|raspi3)
+    case $PLATFORM in
+      disk)
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 110
+
+        nodeos-bootfs                \
+            -D $BAREBONES/dts        \
+            -F $PLATFORM             \
+            -K $BAREBONES/zImage     \
+            -I $INITRAMFS            \
+            -O $STEP_DIR/disk.img    \
+            -U $STEP_DIR/usersfs.img || err 111
+
+        rm -f $STEP_DIR/usersfs.img || err 112
+      ;;
+
+      img)
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 120
+
+        nodeos-bootfs                \
+            -D $BAREBONES/dts        \
+            -F $PLATFORM             \
+            -K $BAREBONES/zImage     \
+            -I $INITRAMFS            \
+            -O $STEP_DIR/bootfs.img  \
+            -U $STEP_DIR/usersfs.img || err 121
+      ;;
+
+      qemu)
+        cp $BAREBONES/zImage $STEP_DIR/kernel || err 130
+
+        mkdir -p $STEP_DIR/dts               &&
+        cp -r $BAREBONES/dts/* $STEP_DIR/dts || err 131
+
+        cp $INITRAMFS $STEP_DIR/initramfs.cpio.gz || err 132
+
+        tar2ext $USERSFS nodeos 1 1 $STEP_DIR/usersfs.img || err 133
+      ;;
+
+      *)
+        echo -e "${RED}Unknown platform '$PLATFORM'${CLR}"
+        err 140
+      ;;
+    esac
+  ;;
+
+  *)
+    echo -e "${RED}Unknown machine '$MACHINE'${CLR}"
+    exit 150
   ;;
 esac
 
-ln -sf node_modules/nodeos-barebones/bzImage           .
-ln -sf node_modules/nodeos-initramfs/initramfs.cpio.gz .
-ln -sf node_modules/nodeos-rootfs/rootfs.iso           .
-ln -sf node_modules/nodeos-usersfs/usersfs.img         .
-
-if [[ ! -z "$RELEASE" ]]; then
-  OUT_DIR=`pwd`/out/$CPU_FAMILY
-  ZIP_FILE=$OUT_DIR-$PLATFORM.zip
-
-  mkdir -p `dirname $OUT_DIR`
-  rm -f $ZIP_FILE
-
-  case $PLATFORM in
-    pc_qemu)
-      zip -j $ZIP_FILE                                  \
-        node_modules/nodeos-barebones/bzImage           \
-        node_modules/nodeos-initramfs/initramfs.cpio.gz \
-        node_modules/nodeos-usersfs/usersfs.img         || exit 10
-
-      eval "echo -e \"$(< resources/runners/qemu.sh)\"" > /tmp/run.sh
-    ;;
-    pc_iso)
-      zip -j $ZIP_FILE                          \
-        node_modules/nodeos-rootfs/rootfs.iso   \
-        node_modules/nodeos-usersfs/usersfs.img || exit 11
-
-      eval "echo -e \"$(< resources/runners/iso.sh)\"" > /tmp/run.sh
-    ;;
-  esac
-
-  chmod +x /tmp/run.sh
-  zip -j $ZIP_FILE /tmp/run.sh || exit 12
-
-  zip -j $ZIP_FILE resources/runners/README.md || exit 13
-fi
-
-
-echo -e "${GRY}------------------------------------------${CLR}"
-echo -e "${GRN}${BLD}Success!${CLR}"
-echo -e "${GRN}You Just Built a Custom NodeOS Image ${WHT}$NOSN${CLR}"
-echo -e "${GRY}------------------------------------------${CLR}"
-echo
-echo -e "- Interactively run your image with:"
-
-case $PLATFORM in
-  docker)
-    echo -e "${WHT}    docker run -t -i $NOSN${CLR}"
-    echo
-    echo -e "- Share your creation with:"
-    echo -e "${WHT}    docker push $NOSN${CLR}"
-  ;;
-  pc_qemu|raspberry_qemu)
-    echo -e "${WHT}    npm start${CLR}"
-  ;;
-esac
+ln -sfn $CPU_FAMILY/$MACHINE/$PLATFORM out/latest

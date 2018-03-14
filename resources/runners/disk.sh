@@ -25,5 +25,4 @@ $QEMU                   \
   -m 256M               \
   -redir tcp:50080::80  \
   -redir tcp:50443::443 \
-  -cdrom bootfs.iso     \
-  -hda usersfs.img
+  -hda disk.img
